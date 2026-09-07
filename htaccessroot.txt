@@ -1,0 +1,21 @@
+# ═══ MedAlert — حماية أساسية على Apache ═══
+# ملاحظة: هذا الملف يعمل مع Apache فقط.
+# مع php -S فالحماية موجودة داخل index.php نفسه (وضع الموجِّه).
+# مع Nginx تحتاج قاعدة location مكافئة — انظر README.md
+
+# 1) امنع تنزيل ملفات البيانات مباشرةً (data.json يحوي هاشات كلمات المرور)
+<FilesMatch "\.(json|md|log|tmp[0-9]*)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# 2) لا تعرض قوائم المجلدات
+Options -Indexes
+
+# 3) ترميز افتراضي
+AddDefaultCharset UTF-8
