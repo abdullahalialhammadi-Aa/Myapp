@@ -593,6 +593,95 @@ def render_sound_cue() -> None:
     )
 
 
+# ------------------------------------------------------------------ النغمة
+
+# لحن هادئ من سلّم دو الخماسي، يدور في حلقة دون أن يزاحم مؤثرات اللعب.
+_PITCH = {
+    "F2": 87.31, "G2": 98.00, "A2": 110.00, "C3": 130.81,
+    "A4": 440.00, "C5": 523.25, "D5": 587.33, "E5": 659.25,
+    "G5": 783.99, "A5": 880.00, "C6": 1046.50,
+}
+
+# أربع مازورات، ثماني نغمات في كل مازورة (السلسلة الفارغة = صمت)
+_MELODY = [
+    "E5", "G5", "A5", "G5", "E5", "D5", "C5", "D5",
+    "E5", "G5", "A5", "C6", "A5", "G5", "E5", "",
+    "D5", "E5", "G5", "E5", "D5", "C5", "A4", "C5",
+    "D5", "E5", "G5", "A5", "G5", "E5", "D5", "",
+]
+_BASS = ["C3", "A2", "F2", "G2"]     # أساس كل مازورة
+_BEAT = 0.26                          # مدة النغمة الواحدة بالثواني
+_MELODY_VOL = 0.11                    # منخفض عمداً ليبقى خلفيةً لا تشويشاً
+_BASS_VOL = 0.07
+
+
+def _render_music() -> bytes:
+    """توليد اللحن كاملاً كملف WAV واحد قابل للتكرار."""
+    beats_per_bar = len(_MELODY) // len(_BASS)
+    total = int(SAMPLE_RATE * len(_MELODY) * _BEAT)
+    samples = [0.0] * total
+
+    for position, name in enumerate(_MELODY):
+        if not name:
+            continue
+        freq = _PITCH[name]
+        start = int(position * _BEAT * SAMPLE_RATE)
+        count = int(_BEAT * SAMPLE_RATE)
+        for n in range(count):
+            if start + n >= total:
+                break
+            progress = n / count
+            # هجوم سريع ثم خفوت، فتبدو النغمة كنقرة آلة وترية
+            envelope = min(1.0, progress / 0.08) * math.exp(-2.4 * progress)
+            samples[start + n] += _MELODY_VOL * envelope * math.sin(
+                2 * math.pi * freq * n / SAMPLE_RATE)
+
+    bar_seconds = beats_per_bar * _BEAT
+    for bar, name in enumerate(_BASS):
+        freq = _PITCH[name]
+        start = int(bar * bar_seconds * SAMPLE_RATE)
+        count = int(bar_seconds * SAMPLE_RATE)
+        for n in range(count):
+            if start + n >= total:
+                break
+            progress = n / count
+            envelope = min(1.0, progress / 0.04) * (1.0 - 0.4 * progress)
+            samples[start + n] += _BASS_VOL * envelope * math.sin(
+                2 * math.pi * freq * n / SAMPLE_RATE)
+
+    # تلاشٍ قصير عند الطرفين حتى لا تُسمع طقطقة عند إعادة الحلقة
+    fade = int(0.035 * SAMPLE_RATE)
+    for n in range(fade):
+        samples[n] *= n / fade
+        samples[total - 1 - n] *= n / fade
+
+    frames = bytearray()
+    for value in samples:
+        frames += struct.pack("<h", int(max(-1.0, min(1.0, value)) * 32767))
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(SAMPLE_RATE)
+        out.writeframes(bytes(frames))
+    return buffer.getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def music_bytes() -> bytes:
+    return _render_music()
+
+
+def render_music() -> None:
+    """مشغّل مخفي يدور باللحن ما دام الصوت مفعّلاً."""
+    if not st.session_state.get("sound_on", True):
+        return
+    # يُرسم في موضع ثابت أعلى الصفحة، فلا يُعاد إنشاؤه مع كل تحديث
+    with st.container(key="bgm"):
+        st.audio(music_bytes(), format="audio/wav", loop=True, autoplay=True)
+
+
 # ==============================================================================
 # 6. المظهر
 # ==============================================================================
@@ -794,6 +883,14 @@ def inject_css() -> None:
         [data-testid="stWidgetLabel"] p {{ color: {MUTED} !important; font-size: .85rem; }}
         [data-testid="stForm"] {{ border: none; padding: 0; }}
         [data-testid="stIconMaterial"] {{ color: {FAINT}; }}
+
+        /* مشغّل النغمة الخلفية: يبقى في الصفحة ويعمل دون أن يُرى.
+           لا نستخدم display:none كي لا يوقف المتصفّح التشغيل. */
+        .st-key-bgm {{
+            position: absolute !important; width: 1px !important;
+            height: 1px !important; overflow: hidden !important;
+            opacity: 0; pointer-events: none;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -1070,9 +1167,9 @@ def page_auth() -> None:
 
 # ------------------------------------------------------------------ القائمة
 
-def top_bar(subtitle: str = "") -> None:
+def top_bar(page: str, subtitle: str = "") -> None:
     """شريط علوي: هوية اللاعب على اليمين وأزرار التنقّل على اليسار."""
-    identity, actions = st.columns([1.3, 1])
+    identity, actions = st.columns([1.1, 1])
 
     with identity:
         db = get_db()
@@ -1095,27 +1192,28 @@ def top_bar(subtitle: str = "") -> None:
         """)
 
     with actions:
-        buttons = st.columns(4 if can_save_scores() else 3)
-        i = 0
-        with buttons[i]:
-            if st.button("🏆 الصدارة", use_container_width=True):
-                go("leaderboard")
-                st.rerun()
-        i += 1
+        # روابط التنقّل، ويُحذف منها رابط الصفحة التي نحن فيها أصلاً
+        links = [("🎮 القائمة", "menu"), ("🏆 الصدارة", "leaderboard")]
         if can_save_scores():
-            with buttons[i]:
-                if st.button("👤 ملفي", use_container_width=True):
-                    go("profile")
+            links.append(("👤 ملفي", "profile"))
+        links = [(label, target) for label, target in links if target != page]
+
+        buttons = st.columns(len(links) + 2)
+        for column, (label, target) in zip(buttons, links):
+            with column:
+                if st.button(label, use_container_width=True, key=f"nav_{target}"):
+                    go(target)
                     st.rerun()
-            i += 1
-        with buttons[i]:
+
+        with buttons[len(links)]:
             icon = "🔊" if st.session_state.sound_on else "🔇"
-            if st.button(icon, use_container_width=True, help="المؤثرات الصوتية"):
+            if st.button(icon, use_container_width=True, key="nav_sound",
+                         help="المؤثرات الصوتية"):
                 st.session_state.sound_on = not st.session_state.sound_on
                 st.rerun()
-        i += 1
-        with buttons[i]:
-            if st.button("خروج", use_container_width=True):
+
+        with buttons[len(links) + 1]:
+            if st.button("خروج", use_container_width=True, key="nav_exit"):
                 st.session_state.user = None
                 st.session_state.is_guest = False
                 go("auth")
@@ -1123,7 +1221,7 @@ def top_bar(subtitle: str = "") -> None:
 
 
 def page_menu() -> None:
-    top_bar()
+    top_bar("menu")
     html('<div style="height:18px"></div>')
     html('<h2 style="margin-bottom:0">اختر مستوى الصعوبة</h2>'
          '<p class="muted" style="margin-top:4px">كل مستوى أصعب يمنحك مضاعف نقاط أعلى</p>')
@@ -1365,7 +1463,7 @@ def page_game() -> None:
 # ------------------------------------------------------------------ الصدارة
 
 def page_leaderboard() -> None:
-    top_bar()
+    top_bar("leaderboard")
     html('<div style="height:16px"></div>')
 
     db = get_db()
@@ -1430,7 +1528,7 @@ def page_leaderboard() -> None:
 # ------------------------------------------------------------------ الملف
 
 def page_profile() -> None:
-    top_bar()
+    top_bar("profile")
     html('<div style="height:16px"></div>')
 
     db = get_db()
@@ -1535,6 +1633,7 @@ def main() -> None:
     st.set_page_config(page_title=APP_NAME, page_icon="🃏", layout="wide")
     init_state()
     inject_css()
+    render_music()
 
     page = st.session_state.page
     if page != "auth" and st.session_state.user is None and not st.session_state.is_guest:
