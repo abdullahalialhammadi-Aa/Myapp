@@ -1,0 +1,5 @@
+# قاعدة البيانات المحلية وأسرار Streamlit لا تُرفع أبداً
+memory_game.db
+*.db-journal
+.streamlit/secrets.toml
+__pycache__/

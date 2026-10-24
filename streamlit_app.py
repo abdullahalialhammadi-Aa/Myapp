@@ -3,7 +3,8 @@
     streamlit run streamlit_app.py
 
 تعمل في المتصفّح مع حسابات ونقاط ولوحة صدارة. تُنشئ بجانبها عند أول تشغيل
-ملف memory_game.db، وحذفه يعيد كل شيء إلى نقطة الصفر.
+ملف memory_game.db، أو تستخدم قاعدة بيانات دائمة إذا وُضع رابطها في الأسرار
+(database_url) — انظر README.md.
 
 محتويات الملف:
     1. الإعدادات        المستويات، قيم النقاط، الرموز، الصور الرمزية
@@ -26,9 +27,7 @@ import math
 import os
 import random
 import re
-import sqlite3
 import struct
-import threading
 import time
 import wave
 from dataclasses import dataclass, field
@@ -278,110 +277,161 @@ class MemoryGame:
 # ==============================================================================
 # 3. قاعدة البيانات
 # ==============================================================================
+#
+# مكان الحفظ:
+#   • إذا وُجد رابط قاعدة بيانات في أسرار Streamlit (database_url) أو في متغيّر
+#     البيئة DATABASE_URL — مثل Postgres من Supabase أو Neon — تُحفظ الحسابات
+#     والنتائج هناك بشكل دائم، ولا تتأثر بإعادة التشغيل أو رفع تعديلات جديدة.
+#   • غير ذلك يُستخدم ملف SQLite بجانب التطبيق (memory_game.db). مناسب للتجربة
+#     على جهازك، لكنه يُمسح على Streamlit Cloud عند كل إعادة تشغيل أو تحديث.
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    password_hash TEXT NOT NULL,
-    salt          TEXT NOT NULL,
-    avatar        TEXT NOT NULL DEFAULT '',
-    created_at    TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS games (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    difficulty TEXT    NOT NULL,
-    score      INTEGER NOT NULL,
-    moves      INTEGER NOT NULL,
-    matches    INTEGER NOT NULL,
-    duration   REAL    NOT NULL,
-    best_combo INTEGER NOT NULL DEFAULT 0,
-    won        INTEGER NOT NULL,
-    played_at  TEXT    NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_games_user ON games(user_id);
-"""
+import sqlalchemy as sa
+
+_META = sa.MetaData()
+
+USERS = sa.Table(
+    "users", _META,
+    sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+    sa.Column("username", sa.Text, nullable=False, unique=True),
+    sa.Column("password_hash", sa.Text, nullable=False),
+    sa.Column("salt", sa.Text, nullable=False),
+    sa.Column("avatar", sa.Text, nullable=False, server_default=""),
+    sa.Column("created_at", sa.Text, nullable=False),
+)
+
+GAMES = sa.Table(
+    "games", _META,
+    sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+    sa.Column("user_id", sa.Integer,
+              sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True),
+    sa.Column("difficulty", sa.Text, nullable=False),
+    sa.Column("score", sa.Integer, nullable=False),
+    sa.Column("moves", sa.Integer, nullable=False),
+    sa.Column("matches", sa.Integer, nullable=False),
+    sa.Column("duration", sa.Float, nullable=False),
+    sa.Column("best_combo", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("won", sa.Integer, nullable=False),
+    sa.Column("played_at", sa.Text, nullable=False),
+)
+
+SETTINGS = sa.Table(
+    "app_settings", _META,
+    sa.Column("key", sa.Text, primary_key=True),
+    sa.Column("value", sa.Text, nullable=False),
+)
+
+
+def database_url() -> str | None:
+    """رابط قاعدة البيانات الدائمة إن وُجد."""
+    try:
+        url = st.secrets.get("database_url")
+    except Exception:  # لا يوجد ملف أسرار
+        url = None
+    url = url or os.environ.get("DATABASE_URL")
+    if not url:
+        return None
+    # Supabase وغيره يعطون postgres:// — SQLAlchemy يحتاج postgresql://
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    return url
 
 
 class Database:
-    """غلاف حول SQLite. مشترك بين جلسات المتصفّح، لذا تُقفل عمليات الكتابة."""
+    """غلاف حول قاعدة البيانات، مشترك بين كل جلسات المتصفّح."""
 
-    def __init__(self, path: Path | str = DB_PATH) -> None:
-        # Streamlit ينفّذ إعادة التشغيل في خيوط مختلفة
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.executescript(_SCHEMA)
-        self.conn.commit()
-        self.lock = threading.Lock()
+    def __init__(self, url: str | None = None) -> None:
+        self.persistent = url is not None
+        if url is None:
+            url = f"sqlite:///{DB_PATH}"
+            self.engine = sa.create_engine(
+                url, connect_args={"check_same_thread": False})
+
+            @sa.event.listens_for(self.engine, "connect")
+            def _fk_on(dbapi_conn, _record):  # noqa: ANN001
+                dbapi_conn.execute("PRAGMA foreign_keys = ON")
+        else:
+            if url.startswith("postgres://"):
+                url = "postgresql://" + url[len("postgres://"):]
+            self.engine = sa.create_engine(url, pool_pre_ping=True, pool_recycle=300)
+        _META.create_all(self.engine)  # لا يحذف ولا يعدّل جداول موجودة
 
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+    def _one(self, sql: str, **params: Any) -> dict | None:
+        with self.engine.connect() as conn:
+            row = conn.execute(sa.text(sql), params).mappings().first()
+        return dict(row) if row else None
+
+    def _all(self, sql: str, **params: Any) -> list[dict]:
+        with self.engine.connect() as conn:
+            rows = conn.execute(sa.text(sql), params).mappings().all()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------ الإعدادات
+
+    def secret_key(self) -> bytes:
+        """مفتاح عشوائي ثابت لتوقيع رموز الجلسة، محفوظ في قاعدة البيانات نفسها."""
+        row = self._one("SELECT value FROM app_settings WHERE key = 'session_key'")
+        if row:
+            return bytes.fromhex(row["value"])
+        key = os.urandom(32).hex()
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(SETTINGS.insert().values(key="session_key", value=key))
+        except sa.exc.IntegrityError:  # جلسة أخرى أنشأته في نفس اللحظة
+            row = self._one("SELECT value FROM app_settings WHERE key = 'session_key'")
+            key = row["value"]
+        return bytes.fromhex(key)
+
     # ------------------------------------------------------------ الحسابات
 
     def username_exists(self, username: str) -> bool:
-        row = self.conn.execute(
-            "SELECT 1 FROM users WHERE username = ? COLLATE NOCASE", (username,)
-        ).fetchone()
-        return row is not None
+        return self.get_user_by_name(username) is not None
 
     def create_user(self, username: str, password_hash: str, salt: str,
                     avatar: str) -> dict:
-        with self.lock:
-            cur = self.conn.execute(
-                "INSERT INTO users (username, password_hash, salt, avatar, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (username, password_hash, salt, avatar, self._now()),
-            )
-            self.conn.commit()
-        return self.get_user(cur.lastrowid)
+        with self.engine.begin() as conn:
+            result = conn.execute(USERS.insert().values(
+                username=username, password_hash=password_hash, salt=salt,
+                avatar=avatar, created_at=self._now()))
+            new_id = result.inserted_primary_key[0]
+        return self.get_user(new_id)
 
     def get_user(self, user_id: int) -> dict | None:
-        row = self.conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-        return dict(row) if row else None
+        return self._one("SELECT * FROM users WHERE id = :id", id=user_id)
 
     def get_user_by_name(self, username: str) -> dict | None:
-        row = self.conn.execute(
-            "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
-        ).fetchone()
-        return dict(row) if row else None
+        return self._one("SELECT * FROM users WHERE lower(username) = lower(:u)",
+                         u=username)
 
     def set_avatar(self, user_id: int, avatar: str) -> None:
-        with self.lock:
-            self.conn.execute("UPDATE users SET avatar = ? WHERE id = ?", (avatar, user_id))
-            self.conn.commit()
+        with self.engine.begin() as conn:
+            conn.execute(sa.text("UPDATE users SET avatar = :a WHERE id = :id"),
+                         {"a": avatar, "id": user_id})
 
     # ------------------------------------------------------------ الجولات
 
     def save_game(self, user_id: int, difficulty: str, score: int, moves: int,
                   matches: int, duration: float, best_combo: int, won: bool) -> None:
-        with self.lock:
-            self.conn.execute(
-                "INSERT INTO games (user_id, difficulty, score, moves, matches,"
-                " duration, best_combo, won, played_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (user_id, difficulty, int(score), int(moves), int(matches),
-                 float(duration), int(best_combo), int(won), self._now()),
-            )
-            self.conn.commit()
+        with self.engine.begin() as conn:
+            conn.execute(GAMES.insert().values(
+                user_id=user_id, difficulty=difficulty, score=int(score),
+                moves=int(moves), matches=int(matches), duration=float(duration),
+                best_combo=int(best_combo), won=int(won), played_at=self._now()))
 
     def recent_games(self, user_id: int, limit: int = 8) -> list[dict]:
-        rows = self.conn.execute(
-            "SELECT * FROM games WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-            (user_id, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        return self._all(
+            "SELECT * FROM games WHERE user_id = :uid ORDER BY id DESC LIMIT :lim",
+            uid=user_id, lim=limit)
 
     # ------------------------------------------------------------ الصدارة
 
     def leaderboard(self, difficulty: str | None = None, limit: int = 100) -> list[dict]:
         """ترتيب اللاعبين حسب مجموع النقاط."""
-        where = "WHERE g.difficulty = ?" if difficulty else ""
-        params: tuple[Any, ...] = (difficulty,) if difficulty else ()
-        rows = self.conn.execute(
+        where = "WHERE g.difficulty = :d" if difficulty else ""
+        rows = self._all(
             f"""
             SELECT u.id AS user_id, u.username, u.avatar,
                    SUM(g.score) AS total_score,
@@ -391,13 +441,16 @@ class Database:
                    MIN(CASE WHEN g.won = 1 THEN g.duration END) AS best_time
             FROM users u JOIN games g ON g.user_id = u.id
             {where}
-            GROUP BY u.id
+            GROUP BY u.id, u.username, u.avatar
             ORDER BY total_score DESC, wins DESC, best_time ASC
-            LIMIT ?
+            LIMIT :lim
             """,
-            (*params, limit),
-        ).fetchall()
-        return [dict(r, rank=i) for i, r in enumerate(rows, start=1)]
+            d=difficulty, lim=limit)
+        for i, r in enumerate(rows, start=1):
+            r["rank"] = i
+            for k in ("total_score", "best_score", "games", "wins"):
+                r[k] = int(r[k] or 0)
+        return rows
 
     def user_rank(self, user_id: int, difficulty: str | None = None) -> int | None:
         for entry in self.leaderboard(difficulty, limit=100000):
@@ -406,13 +459,13 @@ class Database:
         return None
 
     def player_count(self) -> int:
-        row = self.conn.execute("SELECT COUNT(DISTINCT user_id) AS n FROM games").fetchone()
+        row = self._one("SELECT COUNT(DISTINCT user_id) AS n FROM games")
         return int(row["n"] or 0)
 
     # ------------------------------------------------------------ إحصاءات
 
     def user_stats(self, user_id: int) -> dict:
-        row = self.conn.execute(
+        stats = self._one(
             """
             SELECT COUNT(*) AS games,
                    COALESCE(SUM(score), 0)   AS total_score,
@@ -422,32 +475,84 @@ class Database:
                    COALESCE(SUM(matches), 0) AS matches,
                    COALESCE(MAX(best_combo), 0) AS best_combo,
                    MIN(CASE WHEN won = 1 THEN duration END) AS best_time
-            FROM games WHERE user_id = ?
+            FROM games WHERE user_id = :uid
             """,
-            (user_id,),
-        ).fetchone()
-        stats = dict(row)
+            uid=user_id)
+        for k in ("games", "total_score", "best_score", "wins", "moves",
+                  "matches", "best_combo"):
+            stats[k] = int(stats[k] or 0)
         stats["losses"] = stats["games"] - stats["wins"]
         stats["accuracy"] = (stats["matches"] / stats["moves"]) if stats["moves"] else 0.0
         stats["win_rate"] = (stats["wins"] / stats["games"]) if stats["games"] else 0.0
         return stats
 
     def best_score_by_difficulty(self, user_id: int) -> dict[str, dict]:
-        rows = self.conn.execute(
+        rows = self._all(
             """
             SELECT difficulty, MAX(score) AS best_score, COUNT(*) AS games,
                    MIN(CASE WHEN won = 1 THEN duration END) AS best_time
-            FROM games WHERE user_id = ? GROUP BY difficulty
+            FROM games WHERE user_id = :uid GROUP BY difficulty
             """,
-            (user_id,),
-        ).fetchall()
-        return {r["difficulty"]: dict(r) for r in rows}
+            uid=user_id)
+        return {r["difficulty"]: r for r in rows}
 
 
 @st.cache_resource
 def get_db() -> Database:
     """اتصال واحد يشترك فيه كل زوّار التطبيق."""
-    return Database()
+    return Database(database_url())
+
+
+# ------------------------------------------------------------ تذكّر الدخول
+# Streamlit ينسى الجلسة عند تحديث الصفحة، لذا نضع في الرابط رمزاً موقَّعاً
+# (رقم المستخدم + تاريخ الانتهاء + توقيع HMAC) يُعيد الدخول تلقائياً.
+
+SESSION_DAYS = 30
+
+
+def make_session_token(user_id: int) -> str:
+    expires = int(time.time()) + SESSION_DAYS * 86400
+    payload = f"{user_id}.{expires}"
+    sig = hmac.new(get_db().secret_key(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{payload}.{sig}"
+
+
+def user_from_token(token: str) -> dict | None:
+    try:
+        uid_text, exp_text, sig = token.split(".")
+        payload = f"{uid_text}.{exp_text}"
+        good = hmac.new(get_db().secret_key(), payload.encode(),
+                        hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(good, sig) or int(exp_text) < time.time():
+            return None
+        return get_db().get_user(int(uid_text))
+    except (ValueError, TypeError):
+        return None
+
+
+def remember_login(user: dict) -> None:
+    st.query_params["s"] = make_session_token(user["id"])
+
+
+def forget_login() -> None:
+    if "s" in st.query_params:
+        del st.query_params["s"]
+
+
+def restore_login() -> None:
+    """يُعيد المستخدم بعد تحديث الصفحة إن كان في الرابط رمز صالح."""
+    if st.session_state.user is not None or st.session_state.is_guest:
+        return
+    token = st.query_params.get("s")
+    if not token:
+        return
+    user = user_from_token(token)
+    if user:
+        st.session_state.user = user
+        if st.session_state.page == "auth":
+            st.session_state.page = "menu"
+    else:
+        forget_login()
 
 
 # ==============================================================================
@@ -1147,6 +1252,7 @@ def page_auth() -> None:
                 st.session_state.user = user
                 st.session_state.is_guest = False
                 st.session_state.auth_error = ""
+                remember_login(user)
                 go("menu")
                 st.rerun()
             except AuthError as exc:
@@ -1162,7 +1268,9 @@ def page_auth() -> None:
             st.rerun()
 
         html(f'<p class="faint center" style="font-size:.8rem;margin-top:18px">'
-             f'الحسابات محفوظة محلياً في قاعدة بيانات بجانب التطبيق</p>')
+             + ('الحسابات والنتائج محفوظة في قاعدة بيانات دائمة</p>'
+                if get_db().persistent else
+                'تنبيه: الحفظ مؤقت — أضف database_url في أسرار التطبيق ليصبح دائماً</p>'))
 
 
 # ------------------------------------------------------------------ القائمة
@@ -1215,6 +1323,7 @@ def top_bar(page: str, subtitle: str = "") -> None:
         with buttons[len(links) + 1]:
             if st.button("خروج", use_container_width=True, key="nav_exit"):
                 st.session_state.user = None
+                forget_login()
                 st.session_state.is_guest = False
                 go("auth")
                 st.rerun()
@@ -1632,6 +1741,7 @@ PAGES = {
 def main() -> None:
     st.set_page_config(page_title=APP_NAME, page_icon="🃏", layout="wide")
     init_state()
+    restore_login()
     inject_css()
     render_music()
 
